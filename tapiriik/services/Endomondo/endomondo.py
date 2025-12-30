@@ -22,8 +22,8 @@ class EndomondoService(ServiceBase):
     DisplayName = "Endomondo"
     DisplayAbbreviation = "EN"
     AuthenticationType = ServiceAuthenticationType.OAuth
-    UserProfileURL = "http://www.endomondo.com/profile/{0}"
-    UserActivityURL = "http://www.endomondo.com/workouts/{1}/{0}"
+    UserProfileURL = "https://www.endomondo.com/profile/{0}"
+    UserActivityURL = "https://www.endomondo.com/users/{0}/workouts/{1}"
 
     PartialSyncRequiresTrigger = True
     AuthenticationNoFrame = True
@@ -33,7 +33,7 @@ class EndomondoService(ServiceBase):
     }
 
     # The complete list:
-    # running,cycling transportation,cycling sport,mountain biking,skating,roller skiing,skiing cross country,skiing downhill,snowboarding,kayaking,kite surfing,rowing,sailing,windsurfing,fitness walking,golfing,hiking,orienteering,walking,riding,swimming,spinning,other,aerobics,badminton,baseball,basketball,boxing,stair climbing,cricket,cross training,dancing,fencing,american football,rugby,soccer,handball,hockey,pilates,polo,scuba diving,squash,table tennis,tennis,beach volley,volleyball,weight training,yoga,martial arts,gymnastics,step counter,crossfit,treadmill running,skateboarding,surfing,snowshoeing,wheelchair,climbing,treadmill walking
+    # running,cycling transportation,cycling sport,mountain biking,skating,roller skiing,skiing cross country,skiing downhill,snowboarding,kayaking,kite surfing,rowing,sailing,windsurfing,fitness walking,golfing,hiking,orienteering,walking,riding,swimming,spinning,other,aerobics,badminton,baseball,basketball,boxing,stair climbing,cricket,cross training,dancing,fencing,american football,rugby,soccer,handball,hockey,pilates,polo,scuba diving,squash,table tennis,tennis,beach volley,volleyball,weight training,yoga,martial arts,gymnastics,step counter,crossfit,treadmill running,skateboarding,surfing,snowshoeing,wheelchair,climbing,treadmill walking,kick scooter,standup paddling,running trail,rowing indoor,floorball,ice skating,skiing touring,rope jumping,stretching,running canicross,paddle tennis,paragliding
     _activityMappings = {
         "running": ActivityType.Running,
         "cycling transportation": ActivityType.Cycling,
@@ -46,15 +46,23 @@ class EndomondoService(ServiceBase):
         "rowing": ActivityType.Rowing,
         "fitness walking": ActivityType.Walking,
         "hiking": ActivityType.Hiking,
-        "orienteering": ActivityType.Walking,
+        "orienteering": ActivityType.Running,
         "walking": ActivityType.Walking,
         "swimming": ActivityType.Swimming,
+        "spinning": ActivityType.Cycling, # indoor cycling
         "other": ActivityType.Other,
+        "cross training": ActivityType.Elliptical, # elliptical training
+        "weight training": ActivityType.StrengthTraining,
         "treadmill running": ActivityType.Running,
         "snowshoeing": ActivityType.Walking,
         "wheelchair": ActivityType.Wheelchair,
         "climbing": ActivityType.Climbing,
-        "treadmill walking": ActivityType.Walking
+        "roller skiing": ActivityType.RollerSkiing,
+        "treadmill walking": ActivityType.Walking,
+        "running trail": ActivityType.Running,
+        "rowing indoor": ActivityType.Rowing,
+        "running canicross": ActivityType.Running,
+        "stand up paddling": ActivityType.StandUpPaddling,
     }
 
     _reverseActivityMappings = {
@@ -71,7 +79,15 @@ class EndomondoService(ServiceBase):
         "swimming": ActivityType.Swimming,
         "other": ActivityType.Other,
         "wheelchair": ActivityType.Wheelchair,
-        "climbing" : ActivityType.Climbing
+        "climbing" : ActivityType.Climbing,
+        "roller skiing": ActivityType.RollerSkiing,
+        "stand up paddling": ActivityType.StandUpPaddling,
+    }
+    
+    _activitiesThatDontRoundTrip = {
+        ActivityType.Cycling,
+        ActivityType.Running,
+        ActivityType.Walking
     }
 
     SupportedActivities = list(_activityMappings.values())
@@ -91,7 +107,7 @@ class EndomondoService(ServiceBase):
             params["resource_owner_secret"] = connection.Authorization["Secret"]
         return OAuth1Session(ENDOMONDO_CLIENT_KEY, client_secret=ENDOMONDO_CLIENT_SECRET, **params)
 
-    def GenerateUserAuthorizationURL(self, level=None):
+    def GenerateUserAuthorizationURL(self, session, level=None):
         oauthSession = self._oauthSession(callback_uri=WEB_ROOT + reverse("oauth_return", kwargs={"service": "endomondo"}))
         tokens = oauthSession.fetch_request_token("https://api.endomondo.com/oauth/request_token")
         redis_token_key = 'endomondo:oauth:%s' % tokens["oauth_token"]
@@ -188,10 +204,16 @@ class EndomondoService(ServiceBase):
                 if "cadence_max" in actInfo:
                     activity.Stats.Cadence.update(ActivityStatistic(ActivityStatisticUnit.RevolutionsPerMinute, max=int(actInfo["cadence_max"])))
 
+                if "power_avg" in actInfo:
+                    activity.Stats.Power = ActivityStatistic(ActivityStatisticUnit.Watts, avg=int(actInfo["power_avg"]))
+
+                if "power_max" in actInfo:
+                    activity.Stats.Power.update(ActivityStatistic(ActivityStatisticUnit.Watts, max=int(actInfo["power_max"])))
+
                 if "title" in actInfo:
                     activity.Name = actInfo["title"]
 
-                activity.ServiceData = {"WorkoutID": int(actInfo["id"])}
+                activity.ServiceData = {"WorkoutID": int(actInfo["id"]), "Sport": actInfo["sport"]}
 
                 activity.CalculateUID()
                 activities.append(activity)
@@ -238,6 +260,8 @@ class EndomondoService(ServiceBase):
 
         activity.GPS = False
 
+        old_location = None
+        in_pause = False
         for pt in resp["points"]:
             wp = Waypoint()
             if "time" not in pt:
@@ -256,11 +280,29 @@ class EndomondoService(ServiceBase):
                 if "alt" in pt:
                     wp.Location.Altitude = pt["alt"]
 
+                if wp.Location == old_location:
+                    # We have seen the point with the same coordinates
+                    # before. This causes other services (e.g Strava) to
+                    # interpret this as if we were standing for a while,
+                    # which causes us having wrong activity time when
+                    # importing. We mark the point as paused in hopes this
+                    # fixes the issue.
+                    in_pause = True
+                    wp.Type = WaypointType.Pause
+                elif in_pause:
+                    in_pause = False
+                    wp.Type = WaypointType.Resume
+
+                old_location = wp.Location
+
             if "hr" in pt:
                 wp.HR = pt["hr"]
 
             if "cad" in pt:
                 wp.Cadence = pt["cad"]
+
+            if "pow" in pt:
+                wp.Power = pt["pow"]
 
             lap.Waypoints.append(wp)
         activity.Stationary = len(lap.Waypoints) == 0
@@ -271,6 +313,19 @@ class EndomondoService(ServiceBase):
         csp.update(str(serviceRecord.ExternalID).encode("utf-8"))
         csp.update(SECRET_KEY.encode("utf-8"))
         return "tap-" + csp.hexdigest()
+    
+    def _getSport(self, activity):
+        # This is an activity type that doesn't round trip
+        if (activity.Type in self._activitiesThatDontRoundTrip and 
+        # We have the original sport
+        "Sport" in activity.ServiceData and 
+        # We know what this sport is
+        activity.ServiceData["Sport"] in self._activityMappings and 
+        # The type didn't change (if we changed from Walking to Cycling, we'd want to let the new value through)
+        activity.Type == self._activityMappings[activity.ServiceData["Sport"]]):
+            return activity.ServiceData["Sport"]
+        else:
+            return [k for k,v in self._reverseActivityMappings.items() if v == activity.Type][0]
 
     def UploadActivity(self, serviceRecord, activity):
         session = self._oauthSession(serviceRecord)
@@ -292,10 +347,12 @@ class EndomondoService(ServiceBase):
             serviceRecord.SetConfiguration({"DeviceRegistered": True})
 
         activity_id = "tap-" + activity.UID + "-" + str(os.getpid())
+        
+        sport = self._getSport(activity)
 
         upload_data = {
             "device_id": device_id,
-            "sport": [k for k,v in self._reverseActivityMappings.items() if v == activity.Type][0],
+            "sport": sport,
             "start_time": self._formatDate(activity.StartTime),
             "end_time": self._formatDate(activity.EndTime),
             "points": []
@@ -350,6 +407,12 @@ class EndomondoService(ServiceBase):
         elif activity.Stats.RunCadence.Max is not None:
             upload_data["cadence_max"] = activity.Stats.RunCadence.asUnits(ActivityStatisticUnit.StepsPerMinute).Max
 
+        if activity.Stats.Power.Average is not None:
+            upload_data["power_avg"] = activity.Stats.Power.asUnits(ActivityStatisticUnit.Watts).Average
+
+        if activity.Stats.Power.Max is not None:
+            upload_data["power_max"] = activity.Stats.Power.asUnits(ActivityStatisticUnit.Watts).Max
+
         for wp in activity.GetFlatWaypoints():
             pt = {
                 "time": self._formatDate(wp.Timestamp),
@@ -366,6 +429,9 @@ class EndomondoService(ServiceBase):
                 pt["cad"] = round(wp.Cadence)
             elif wp.RunCadence is not None:
                 pt["cad"] = round(wp.RunCadence)
+
+            if wp.Power is not None:
+                pt["pow"] = round(wp.Power)
 
             if wp.Type == WaypointType.Pause:
                 pt["inst"] = "pause"
